@@ -1,6 +1,7 @@
+using Unity.Netcode;
 using UnityEngine;
 
-public class PlayerMove : MonoBehaviour
+public class PlayerMove : NetworkBehaviour
 {
     [Header("Movement")]
     [SerializeField] private float speed;
@@ -11,13 +12,14 @@ public class PlayerMove : MonoBehaviour
     [Header("Camera & Rotation")]
     [SerializeField] private float rotationSpeed = 1.0f;
     [SerializeField] private Transform cameraTarget;
+    [SerializeField] private Camera playerCamera;
     [SerializeField] private float topClamp = 90.0f;
     [SerializeField] private float bottomClamp = -90.0f;
 
     [Header("Pickup & Throw")]
     [SerializeField] private Transform holdPoint;
     [SerializeField] private float pickupRange = 3.5f;
-    [SerializeField] private float holdFollowSpeed = 14f;
+    [SerializeField] private float holdSmoothSpeed = 15f;
     [SerializeField] private float throwForce = 12f;
     [SerializeField] private LayerMask pickupMask = ~0;
 
@@ -31,24 +33,55 @@ public class PlayerMove : MonoBehaviour
     private float currentSpeed;
 
     private Rigidbody heldRb;
+    private Transform prevParent;
     private bool prevUseGravity;
 
-    void Start()
+    void Awake()
     {
         controller = GetComponent<CharacterController>();
-        Cursor.lockState = CursorLockMode.Locked;
-
-        if (holdPoint == null && cameraTarget != null)
+        if (playerCamera == null && cameraTarget != null)
         {
-            GameObject hp = new GameObject("HoldPoint");
-            hp.transform.SetParent(cameraTarget);
-            hp.transform.localPosition = new Vector3(0f, -0.15f, 1.8f);
-            holdPoint = hp.transform;
+            playerCamera = cameraTarget.GetComponentInChildren<Camera>();
+        }
+    }
+
+    public override void OnNetworkSpawn()
+    {
+        if (IsOwner)
+        {
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
+
+            if (playerCamera != null)
+            {
+                playerCamera.enabled = true;
+                AudioListener listener = playerCamera.GetComponent<AudioListener>();
+                if (listener != null) listener.enabled = true;
+            }
+
+            if (holdPoint == null && cameraTarget != null)
+            {
+                GameObject hp = new GameObject("HoldPoint");
+                hp.transform.SetParent(cameraTarget);
+                hp.transform.localPosition = new Vector3(0f, -0.15f, 1.8f);
+                holdPoint = hp.transform;
+            }
+        }
+        else
+        {
+            if (playerCamera != null)
+            {
+                playerCamera.enabled = false;
+                AudioListener listener = playerCamera.GetComponent<AudioListener>();
+                if (listener != null) listener.enabled = false;
+            }
         }
     }
 
     void Update()
     {
+        if (!IsSpawned || !IsOwner) return;
+
         isGrounded = controller.isGrounded;
         if (isGrounded && velocity.y < 0)
         {
@@ -58,14 +91,10 @@ public class PlayerMove : MonoBehaviour
         GetInput();
         DoRotation();
         HandlePickupInput();
+        UpdateHeldPosition();
 
         velocity.y += gravity * Time.deltaTime;
         controller.Move(velocity * Time.deltaTime);
-    }
-
-    void FixedUpdate()
-    {
-        MoveHeldObject();
     }
 
     private void GetInput()
@@ -98,27 +127,26 @@ public class PlayerMove : MonoBehaviour
 
         cinemachineTargetPitch = ClampAngle(cinemachineTargetPitch, bottomClamp, topClamp);
 
-        cameraTarget.localRotation = Quaternion.Euler(cinemachineTargetPitch, 0.0f, 0.0f);
+        if (cameraTarget != null)
+        {
+            cameraTarget.localRotation = Quaternion.Euler(cinemachineTargetPitch, 0.0f, 0.0f);
+        }
 
         transform.Rotate(Vector3.up * rotationVelocity);
     }
 
     private void HandlePickupInput()
     {
-        // ЛКМ: взять или отпустить предмет
-        if (Input.GetMouseButtonDown(0))
+        if (Input.GetMouseButtonDown(0) && heldRb == null)
         {
-            if (heldRb != null)
-            {
-                DropObject();
-            }
-            else
-            {
-                TryPickupObject();
-            }
+            TryPickupObject();
         }
 
-        // ПКМ: кинуть предмет
+        if (Input.GetMouseButtonUp(0) && heldRb != null)
+        {
+            DropObject();
+        }
+
         if (Input.GetMouseButtonDown(1) && heldRb != null)
         {
             ThrowObject();
@@ -127,56 +155,63 @@ public class PlayerMove : MonoBehaviour
 
     private void TryPickupObject()
     {
-        if (cameraTarget == null) return;
+        Transform rayOrigin = playerCamera != null ? playerCamera.transform : cameraTarget;
+        if (rayOrigin == null) return;
 
-        Ray ray = new Ray(cameraTarget.position, cameraTarget.forward);
+        Ray ray = new Ray(rayOrigin.position, rayOrigin.forward);
+        Debug.DrawRay(ray.origin, ray.direction * pickupRange, Color.yellow, 1f);
+
         if (Physics.Raycast(ray, out RaycastHit hit, pickupRange, pickupMask, QueryTriggerInteraction.Ignore))
         {
-            Rigidbody rb = hit.rigidbody;
+            Rigidbody rb = hit.collider.attachedRigidbody;
             if (rb != null && !rb.isKinematic)
             {
                 heldRb = rb;
+                prevParent = heldRb.transform.parent;
                 prevUseGravity = heldRb.useGravity;
+
                 heldRb.useGravity = false;
-                heldRb.linearDamping = 10f;
-                heldRb.angularDamping = 5f;
+                heldRb.isKinematic = true;
+                heldRb.transform.SetParent(holdPoint);
             }
         }
     }
 
-    private void MoveHeldObject()
+    private void UpdateHeldPosition()
     {
         if (heldRb == null || holdPoint == null) return;
 
-        if (Vector3.Distance(heldRb.position, holdPoint.position) > pickupRange * 1.35f)
-        {
-            DropObject();
-            return;
-        }
-
-        Vector3 toTarget = holdPoint.position - heldRb.position;
-        heldRb.linearVelocity = toTarget * holdFollowSpeed;
+        heldRb.transform.localPosition = Vector3.Lerp(
+            heldRb.transform.localPosition,
+            Vector3.zero,
+            holdSmoothSpeed * Time.deltaTime
+        );
     }
 
     private void DropObject()
     {
         if (heldRb == null) return;
 
+        heldRb.transform.SetParent(prevParent);
+        heldRb.isKinematic = false;
         heldRb.useGravity = prevUseGravity;
-        heldRb.linearDamping = 0.05f;
-        heldRb.angularDamping = 0.05f;
         heldRb = null;
+        prevParent = null;
     }
 
     private void ThrowObject()
     {
-        if (heldRb == null || cameraTarget == null) return;
+        if (heldRb == null) return;
 
+        Transform dirSource = playerCamera != null ? playerCamera.transform : cameraTarget;
         Rigidbody rbToThrow = heldRb;
         DropObject();
 
-        Vector3 throwDir = (cameraTarget.forward + Vector3.up * 0.15f).normalized;
-        rbToThrow.AddForce(throwDir * throwForce, ForceMode.Impulse);
+        Vector3 dir = dirSource != null
+            ? (dirSource.forward + Vector3.up * 0.15f).normalized
+            : (transform.forward + Vector3.up * 0.15f).normalized;
+
+        rbToThrow.AddForce(dir * throwForce, ForceMode.Impulse);
     }
 
     private float ClampAngle(float lfAngle, float lfMin, float lfMax)
